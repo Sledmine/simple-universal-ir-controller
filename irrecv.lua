@@ -1,106 +1,60 @@
--- irrecv.lua
+-- irrecv.lua  
 -- IR Receiver module for NodeMCU (ESP8266, Lua)
--- Supports NEC, Sony SIRC12, basic raw capture + raw decode
+-- Based on Arduino IRRemoteDecoder implementation
 local bit = bit or require("bit")
 local irrecv = {}
 local pin, cb, gap, running
-local lastTime, durations, lastLevel
+local lastTime, durations, lastLevel, isFirstTrigger
 
--- NEC decode
-local function decodeNEC(d)
-    if #d < 66 then
-        return nil
+-- Decode IR command
+-- Expects 32 time periods between falling edges (microseconds)
+local function decodeCommand(d)
+    if #d ~= 32 then
+        return nil -- Must have exactly 32 time periods
     end
-    local leadMark, leadSpace = d[1], d[2]
-    if leadMark < 8500 or leadMark > 9500 then
-        return nil
-    end
-    if leadSpace < 4000 or leadSpace > 5000 then
-        return nil
-    end
-
-    local addr, cmd = 0, 0
-    for i = 3, 66, 2 do
-        local mark, space = d[i], d[i + 1]
-        if mark < 400 or mark > 700 then
-            return nil
+    
+    local receiveStream = 0
+    
+    for i = 1, 32 do
+        local timePeriod = d[i]
+        
+        -- Check for gap/reset condition
+        if timePeriod > gap then
+            return nil -- Reset condition, invalid frame
         end
-        local bitVal = (space > 1000) and 1 or 0
-        if i <= 34 then
-            addr = bit.bor(bit.lshift(addr, 1), bitVal)
+        
+        -- Decode based on time period thresholds
+        -- 1000-1300us = '0' bit, 2000-2500us = '1' bit
+        if timePeriod > 1000 and timePeriod < 1300 and i ~= 32 then
+            -- '0' bit: just shift left
+            receiveStream = bit.lshift(receiveStream, 1)
+        elseif timePeriod > 2000 and timePeriod < 2500 then
+            -- '1' bit: OR with 1, then shift (except for last bit)
+            receiveStream = bit.bor(receiveStream, 1)
+            if i ~= 32 then
+                receiveStream = bit.lshift(receiveStream, 1)
+            end
         else
-            cmd = bit.bor(bit.lshift(cmd, 1), bitVal)
-        end
-    end
-    return {proto = "NEC", addr = addr, cmd = cmd}
-end
-
--- Sony SIRC12 decode (simplified)
-local function decodeSony(d)
-    if #d < 24 then -- SIRC12 needs at least 24 transitions (12 bits * 2)
-        return nil
-    end
-    local lead = d[1]
-    if lead < 2000 or lead > 2600 then
-        return nil
-    end
-    local value = 0
-    local bitCount = 0
-    -- Start from position 2 (after lead pulse)
-    for i = 2, #d - 1, 2 do
-        if i + 1 > #d then break end
-        local mark, space = d[i], d[i + 1]
-        if not mark or not space then break end
-        
-        -- Sony SIRC uses pulse width encoding
-        local bitVal = (mark > 900) and 1 or 0  -- Adjusted threshold
-        value = bit.bor(value, bit.lshift(bitVal, bitCount))
-        bitCount = bitCount + 1
-        
-        if bitCount >= 12 then -- SIRC12 has 12 bits max
-            break
+            -- Invalid timing, reject frame
+            return nil
         end
     end
     
-    if bitCount >= 7 then -- At least 7 bits for a valid SIRC signal
-        return {proto = "SIRC12", value = value, bits = bitCount}
-    end
-    return nil
+    return {
+        command = receiveStream,
+        hex = string.format("0x%08X", receiveStream),
+        raw = d
+    }
 end
 
--- Generic RAW-to-bits decode (simple heuristic for NEC-like pulses)
-local function decodeRaw(d)
-    local bits = {}
-    for i = 3, #d - 1, 2 do
-        local mark, space = d[i], d[i + 1]
-        if not mark or not space then
-            break
-        end
-        if mark > 300 and mark < 900 then
-            if space > 300 and space < 1000 then
-                bits[#bits + 1] = 0
-            elseif space > 1200 and space < 1800 then
-                bits[#bits + 1] = 1
-            end
-        end
-    end
-    return bits
-end
-
--- Dispatch decoder chain
-local function tryDecode(d)
-    local r = decodeNEC(d) or decodeSony(d)
-    if r then
-        return r
-    end
-    -- fallback to raw
-    local bits = decodeRaw(d)
-    return {proto = "RAW", bits = bits, durations = d}
-end
-
--- Edge interrupt handler
+-- Edge interrupt handler (falling edge trigger like Arduino)
 local function onChange(level)
     local now = tmr.now()
+    
+    -- Only trigger on falling edge (level = 0), matching Arduino behavior
+    if level ~= 0 then
+        return
+    end
     
     if lastTime then
         local dur = now - lastTime
@@ -109,24 +63,32 @@ local function onChange(level)
             dur = dur + 4294967296 -- 2^32 for proper overflow handling
         end
         
-        -- Check for end of frame (long gap)
-        if dur > gap then
-            -- Long gap detected - end of frame
-            if #durations > 4 then
-                local result = tryDecode(durations)
-                if cb and result then
-                    cb(result)
+        if isFirstTrigger then
+            -- Start capturing after first falling edge detected
+            -- Check for gap/reset condition (>2.5ms = 2500us)
+            if dur > gap then
+                -- Reset capture
+                durations = {}
+                isFirstTrigger = false
+            else
+                -- Add duration to capture buffer
+                durations[#durations + 1] = dur
+                
+                -- Check if we have captured 32 time periods
+                if #durations == 32 then
+                    local result = decodeCommand(durations)
+                    if cb and result then
+                        cb(result)
+                    end
+                    -- Reset for next capture
+                    durations = {}
+                    isFirstTrigger = false
                 end
             end
-            -- Reset for next frame
-            durations = {}
-            lastTime = now
-            lastLevel = level
-            return
+        else
+            -- First falling edge occurred, start capturing from next edge
+            isFirstTrigger = true
         end
-        
-        -- Add duration to current frame
-        durations[#durations + 1] = dur
     end
     
     lastTime = now
@@ -141,16 +103,17 @@ function irrecv.setup(gpioPin, opts)
     
     pin = gpioPin
     cb = opts and opts.callback or nil
-    gap = opts and opts.gap or 8000
+    gap = opts and opts.gap or 2500
     
     -- Initialize state variables
     durations = {}
     lastTime = nil
     lastLevel = nil
+    isFirstTrigger = false
     
-    -- Setup GPIO
-    gpio.mode(pin, gpio.INT)
-    gpio.trig(pin, "both", onChange)
+    -- Setup GPIO with pullup
+    gpio.mode(pin, gpio.INT, gpio.PULLUP)
+    gpio.trig(pin, "both", onChange)  -- Monitor both edges for proper timing
     running = true
 end
 
@@ -172,7 +135,8 @@ function irrecv.getStatus()
         gap = gap,
         durationsCount = durations and #durations or 0,
         lastTime = lastTime,
-        lastLevel = lastLevel
+        lastLevel = lastLevel,
+        isFirstTrigger = isFirstTrigger
     }
 end
 
